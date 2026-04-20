@@ -1,0 +1,912 @@
+import { useState, useEffect } from "react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+
+const ADMIN_PASSWORD = "RallyPoint2026";
+const K = 32;
+const DEFAULT_ELO = 0;
+const STORAGE_KEY = "padel_data";
+const TOURNEY_ID = "bronze_mini_3";
+const TOURNEY_NAME = "Pegel Padel Lower Bronze Mini-Tourney (vol. 3)";
+
+const TIERS = [
+  { label: "Beginner",       min: 0,    max: 499,  color: "#888780", bg: "#F1EFE8" },
+  { label: "Upper Beginner", min: 500,  max: 1000, color: "#5F5E5A", bg: "#D3D1C7" },
+  { label: "Lower Bronze",   min: 1001, max: 2000, color: "#854F0B", bg: "#FAEEDA" },
+  { label: "Bronze",         min: 2001, max: 3000, color: "#633806", bg: "#FAC775" },
+  { label: "Low Silver",     min: 3001, max: 4000, color: "#185FA5", bg: "#B5D4F4" },
+  { label: "Silver",         min: 4001, max: 5000, color: "#0C447C", bg: "#85B7EB" },
+  { label: "Gold",           min: 5001, max: 7000, color: "#BA7517", bg: "#FAC775" },
+];
+
+function getTier(elo) {
+  return TIERS.find(t => elo >= t.min && elo <= t.max) || TIERS[0];
+}
+
+function calcElo(ra, rb, won) {
+  const ea = 1 / (1 + Math.pow(10, (rb - ra) / 400));
+  return Math.round(ra + K * ((won ? 1 : 0) - ea));
+}
+
+function teamAvgElo(players, ids) {
+  const ps = ids.map(id => players.find(p => p.id === id)).filter(Boolean);
+  return ps.length ? Math.round(ps.reduce((s, p) => s + p.elo, 0) / ps.length) : DEFAULT_ELO;
+}
+
+function initStorage() {
+  return { players: [], matches: [], tournaments: [], tourney: null };
+}
+
+function generateGroupSchedule(teams) {
+  const schedule = [];
+  for (let i = 0; i < teams.length; i++)
+    for (let j = i + 1; j < teams.length; j++)
+      schedule.push({ id: `${teams[i].id}_${teams[j].id}`, team1Id: teams[i].id, team2Id: teams[j].id, score1: null, score2: null });
+  return schedule;
+}
+
+function loadData() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return initStorage();
+    const parsed = JSON.parse(raw);
+    if (parsed.tourney && !parsed.tourney.schedule) parsed.tourney.schedule = { A: [], B: [] };
+    if (parsed.tourney && !parsed.tourney.groupMatches) parsed.tourney.groupMatches = [];
+    return parsed;
+  } catch { return initStorage(); }
+}
+
+function saveData(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
+}
+
+function PlayerSelect({ value, onChange, exclude, players, inp }) {
+  const [search, setSearch] = useState("");
+  const excl = exclude || [];
+  const filtered = players.filter(p => !excl.includes(p.id) && p.name.toLowerCase().includes(search.toLowerCase()));
+  return (
+    <div>
+      <input placeholder="Search player..." value={search} onChange={e => setSearch(e.target.value)} style={{ ...inp, marginBottom: 4, fontSize: 12 }} />
+      <select value={value} onChange={e => onChange(e.target.value)} style={inp}>
+        <option value="">Select...</option>
+        {filtered.map(p => <option key={p.id} value={p.id}>{p.name} ({p.elo})</option>)}
+      </select>
+    </div>
+  );
+}
+
+export default function App() {
+  const [data, setData] = useState(() => loadData());
+  const [tab, setTab] = useState("leaderboard");
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [pwInput, setPwInput] = useState("");
+  const [pwError, setPwError] = useState(false);
+  const [showLogin, setShowLogin] = useState(false);
+  const [selectedPlayer, setSelectedPlayer] = useState(null);
+  const [msg, setMsg] = useState("");
+  const [selectedTournament, setSelectedTournament] = useState("all");
+  const [editingPlayer, setEditingPlayer] = useState(null);
+  const [editName, setEditName] = useState("");
+  const [editGender, setEditGender] = useState("male");
+  const [editRating, setEditRating] = useState(0);
+  const [newPlayer, setNewPlayer] = useState("");
+  const [newGender, setNewGender] = useState("male");
+  const [newRating, setNewRating] = useState(0);
+  const [genderFilter, setGenderFilter] = useState("all");
+  const [tierFilter, setTierFilter] = useState("all");
+  const emptyMatch = { t1p1: "", t1p2: "", t2p1: "", t2p2: "", s1: "", s2: "", tournament: "", date: new Date().toISOString().slice(0, 10) };
+  const [matchForm, setMatchForm] = useState(emptyMatch);
+  const [tournamentForm, setTournamentForm] = useState({ name: "", date: new Date().toISOString().slice(0, 10) });
+  const [tTab, setTTab] = useState("standings");
+  const [teamForm, setTeamForm] = useState({ name: "", p1: "", p2: "", group: "A" });
+  const [editingTeam, setEditingTeam] = useState(null);
+  const [editTeamForm, setEditTeamForm] = useState({ name: "", p1: "", p2: "", group: "A" });
+  const [groupMatchForm, setGroupMatchForm] = useState({ matchId: "", s1: "", s2: "" });
+  const [koMatchForm, setKoMatchForm] = useState({ round: "sf1", s1: "", s2: "" });
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+
+  function save(nd) { setData(nd); saveData(nd); }
+  function flash(m) { setMsg(m); setTimeout(() => setMsg(""), 2500); }
+
+  function login() {
+    if (pwInput === ADMIN_PASSWORD) { setIsAdmin(true); setShowLogin(false); setPwError(false); setPwInput(""); }
+    else setPwError(true);
+  }
+
+  function resetAllElo() {
+    save({ ...data, players: data.players.map(p => ({ ...p, elo: DEFAULT_ELO, wins: 0, losses: 0, history: [] })), matches: [] });
+    setShowResetConfirm(false); flash("All ratings reset to 0!");
+  }
+
+  function addPlayer() {
+    const name = newPlayer.trim();
+    if (!name) return;
+    if (data.players.find(p => p.name.toLowerCase() === name.toLowerCase())) { flash("Player already exists"); return; }
+    save({ ...data, players: [...data.players, { id: Date.now(), name, gender: newGender, elo: Math.max(0, parseInt(newRating) || 0), wins: 0, losses: 0, history: [] }] });
+    setNewPlayer(""); setNewRating(0); flash(`${name} added!`);
+  }
+
+  function addTournament() {
+    const name = tournamentForm.name.trim();
+    if (!name) return;
+    save({ ...data, tournaments: [...data.tournaments, { id: Date.now(), name, date: tournamentForm.date }] });
+    setTournamentForm({ name: "", date: new Date().toISOString().slice(0, 10) });
+    flash(`"${name}" created!`);
+  }
+
+  function logMatch() {
+    const { t1p1, t1p2, t2p1, t2p2, s1, s2, tournament, date } = matchForm;
+    const ids = [t1p1, t1p2, t2p1, t2p2];
+    if (ids.some(x => !x)) { flash("Select all 4 players"); return; }
+    if (new Set(ids).size < 4) { flash("Each player must be unique"); return; }
+    const score1 = parseInt(s1), score2 = parseInt(s2);
+    if (isNaN(score1) || isNaN(score2) || score1 < 0 || score2 < 0) { flash("Invalid scores"); return; }
+    if (score1 === score2) { flash("Scores cannot be equal"); return; }
+    const t1ids = [parseInt(t1p1), parseInt(t1p2)], t2ids = [parseInt(t2p1), parseInt(t2p2)];
+    const won1 = score1 > score2;
+    const avg1 = teamAvgElo(data.players, t1ids), avg2 = teamAvgElo(data.players, t2ids);
+    const mid = Date.now();
+    const eloChanges = {};
+    const players = data.players.map(p => {
+      const isT1 = t1ids.includes(p.id), isT2 = t2ids.includes(p.id);
+      if (!isT1 && !isT2) return p;
+      const won = isT1 ? won1 : !won1;
+      const oldElo = p.elo, newElo = Math.max(0, calcElo(oldElo, isT1 ? avg2 : avg1, won));
+      eloChanges[p.id] = { before: oldElo, after: newElo };
+      return { ...p, elo: newElo, wins: p.wins + (won ? 1 : 0), losses: p.losses + (won ? 0 : 1), history: [...p.history, { matchId: mid, elo: newElo, date }] };
+    });
+    save({ ...data, players, matches: [{ id: mid, date, tournament: tournament ? parseInt(tournament) : null, team1: { playerIds: t1ids, score: score1 }, team2: { playerIds: t2ids, score: score2 }, eloChanges }, ...data.matches] });
+    setMatchForm(emptyMatch); flash("Match logged!");
+  }
+
+  function deleteMatch(id) { save({ ...data, matches: data.matches.filter(m => m.id !== id) }); flash("Match deleted"); }
+  function deletePlayer(id) { save({ ...data, players: data.players.filter(p => p.id !== id) }); flash("Player removed"); }
+  function deleteTournament(id) { save({ ...data, tournaments: data.tournaments.filter(t => t.id !== id) }); flash("Tournament deleted"); }
+
+  function startEdit(p) { setEditingPlayer(p.id); setEditName(p.name); setEditGender(p.gender || "male"); setEditRating(p.elo); }
+  function saveEdit(id) {
+    const name = editName.trim();
+    if (!name) return;
+    if (data.players.find(p => p.name.toLowerCase() === name.toLowerCase() && p.id !== id)) { flash("Name already taken"); return; }
+    save({ ...data, players: data.players.map(p => p.id === id ? { ...p, name, gender: editGender, elo: Math.max(0, parseInt(editRating) || 0) } : p) });
+    setEditingPlayer(null); setEditName(""); flash("Player updated!");
+  }
+
+  function initTourney() {
+    save({ ...data, tourney: { id: TOURNEY_ID, teams: [], groupMatches: [], schedule: { A: [], B: [] }, ko: null } });
+    flash("Tournament initialized!");
+  }
+
+  function addTeam() {
+    const { name, p1, p2, group } = teamForm;
+    if (!name.trim() || !p1 || !p2) { flash("Fill all team fields"); return; }
+    if (p1 === p2) { flash("Players must be different"); return; }
+    const t = data.tourney;
+    if (t.teams.filter(tm => tm.group === group).length >= 6) { flash(`Group ${group} is full`); return; }
+    const used = t.teams.flatMap(tm => [tm.p1, tm.p2]);
+    if (used.includes(parseInt(p1)) || used.includes(parseInt(p2))) { flash("Player already in a team"); return; }
+    const newTeam = { id: Date.now(), name: name.trim(), p1: parseInt(p1), p2: parseInt(p2), group };
+    const updatedTeams = [...t.teams, newTeam];
+    const updatedSchedule = { ...t.schedule };
+    const groupTeams = updatedTeams.filter(tm => tm.group === group);
+    if (groupTeams.length === 6) { updatedSchedule[group] = generateGroupSchedule(groupTeams); flash(`Group ${group} full — schedule generated!`); }
+    else flash(`Team "${name.trim()}" added to Group ${group}!`);
+    save({ ...data, tourney: { ...t, teams: updatedTeams, schedule: updatedSchedule } });
+    setTeamForm({ name: "", p1: "", p2: "", group: "A" });
+  }
+
+  function deleteTeam(id) {
+    const t = data.tourney;
+    const tm = t.teams.find(x => x.id === id);
+    save({ ...data, tourney: { ...t, teams: t.teams.filter(x => x.id !== id), schedule: { ...t.schedule, [tm.group]: [] } } });
+  }
+
+  function startEditTeam(tm) { setEditingTeam(tm.id); setEditTeamForm({ name: tm.name, p1: String(tm.p1), p2: String(tm.p2), group: tm.group }); }
+
+  function saveEditTeam(id) {
+    const { name, p1, p2, group } = editTeamForm;
+    if (!name.trim() || !p1 || !p2) return;
+    if (p1 === p2) { flash("Players must be different"); return; }
+    const t = data.tourney;
+    const oldTeam = t.teams.find(tm => tm.id === id);
+    const used = t.teams.filter(tm => tm.id !== id).flatMap(tm => [tm.p1, tm.p2]);
+    if (used.includes(parseInt(p1)) || used.includes(parseInt(p2))) { flash("Player already in a team"); return; }
+    const updatedTeams = t.teams.map(tm => tm.id === id ? { ...tm, name: name.trim(), p1: parseInt(p1), p2: parseInt(p2), group } : tm);
+    const updatedSchedule = { ...t.schedule };
+    if (oldTeam.group !== group) { updatedSchedule[oldTeam.group] = []; updatedSchedule[group] = []; }
+    else { const gt = updatedTeams.filter(tm => tm.group === group); if (gt.length === 6) updatedSchedule[group] = generateGroupSchedule(gt); }
+    save({ ...data, tourney: { ...t, teams: updatedTeams, schedule: updatedSchedule } });
+    setEditingTeam(null); flash("Team updated!");
+  }
+
+  function logGroupMatch() {
+    const { matchId, s1, s2 } = groupMatchForm;
+    if (!matchId || s1 === "" || s2 === "") { flash("Select match and enter scores"); return; }
+    const score1 = parseInt(s1), score2 = parseInt(s2);
+    if (isNaN(score1) || isNaN(score2)) { flash("Invalid scores"); return; }
+    if (score1 === score2) { flash("No draws allowed"); return; }
+    if (score1 !== 4 && score2 !== 4) { flash("Winner must have exactly 4 games"); return; }
+    if (score1 > 4 || score2 > 4) { flash("Max score is 4"); return; }
+    let matchGroup = null, scheduleMatch = null;
+    for (const g of ["A", "B"]) {
+      const m = data.tourney.schedule[g]?.find(m => m.id === matchId);
+      if (m) { matchGroup = g; scheduleMatch = m; break; }
+    }
+    if (!scheduleMatch) return;
+    const t = data.tourney;
+    const team1 = t.teams.find(tm => tm.id === scheduleMatch.team1Id);
+    const team2 = t.teams.find(tm => tm.id === scheduleMatch.team2Id);
+    if (!team1 || !team2) return;
+    const won1 = score1 > score2, mid = Date.now();
+    const avg1 = teamAvgElo(data.players, [team1.p1, team1.p2]);
+    const avg2 = teamAvgElo(data.players, [team2.p1, team2.p2]);
+    const players = data.players.map(p => {
+      const isT1 = [team1.p1, team1.p2].includes(p.id);
+      const isT2 = [team2.p1, team2.p2].includes(p.id);
+      if (!isT1 && !isT2) return p;
+      const won = isT1 ? won1 : !won1;
+      const newElo = Math.max(0, calcElo(p.elo, isT1 ? avg2 : avg1, won));
+      return { ...p, elo: newElo, wins: p.wins + (won ? 1 : 0), losses: p.losses + (won ? 0 : 1), history: [...p.history, { matchId: mid, elo: newElo, date: new Date().toISOString().slice(0, 10) }] };
+    });
+    const updatedSchedule = { ...t.schedule, [matchGroup]: t.schedule[matchGroup].map(m => m.id === matchId ? { ...m, score1, score2 } : m) };
+    save({ ...data, players, tourney: { ...t, schedule: updatedSchedule, groupMatches: [...t.groupMatches, { id: mid, group: matchGroup, team1Id: team1.id, team2Id: team2.id, score1, score2 }] } });
+    setGroupMatchForm({ matchId: "", s1: "", s2: "" }); flash("Group match logged!");
+  }
+
+  function resetGroupMatch(scheduleMatchId) {
+    const t = data.tourney;
+    let matchGroup = null;
+    for (const g of ["A", "B"]) { if (t.schedule[g]?.find(m => m.id === scheduleMatchId)) { matchGroup = g; break; } }
+    if (!matchGroup) return;
+    save({ ...data, tourney: { ...t, schedule: { ...t.schedule, [matchGroup]: t.schedule[matchGroup].map(m => m.id === scheduleMatchId ? { ...m, score1: null, score2: null } : m) } } });
+    flash("Match reset");
+  }
+
+  function getGroupStandings(group) {
+    if (!data.tourney) return [];
+    const teams = data.tourney.teams.filter(t => t.group === group);
+    const schedule = data.tourney.schedule[group] || [];
+    return teams.map(tm => {
+      const played = schedule.filter(m => (m.team1Id === tm.id || m.team2Id === tm.id) && m.score1 !== null);
+      let wins = 0, losses = 0, gf = 0;
+      played.forEach(m => {
+        const isT1 = m.team1Id === tm.id;
+        const ms = isT1 ? m.score1 : m.score2, os = isT1 ? m.score2 : m.score1;
+        gf += ms;
+        if (ms > os) wins++; else losses++;
+      });
+      return { ...tm, played: played.length, wins, losses, gf, pts: gf };
+    }).sort((a, b) => b.pts - a.pts || b.wins - a.wins);
+  }
+
+  function setKoSlots() {
+    const a = getGroupStandings("A"), b = getGroupStandings("B");
+    if (a.length < 2 || b.length < 2) { flash("Need at least 2 teams in each group"); return; }
+    save({ ...data, tourney: { ...data.tourney, ko: { sf1: { team1Id: a[0].id, team2Id: b[1].id, score1: null, score2: null }, sf2: { team1Id: b[0].id, team2Id: a[1].id, score1: null, score2: null }, final: null, third: null } } });
+    flash("Knockout bracket set!");
+  }
+
+  function logKoMatch(round) {
+    const { s1, s2 } = koMatchForm;
+    const score1 = parseInt(s1), score2 = parseInt(s2);
+    if (isNaN(score1) || isNaN(score2)) { flash("Invalid scores"); return; }
+    if (score1 === score2) { flash("No draws allowed"); return; }
+    if (score1 !== 6 && score2 !== 6) { flash("Winner must have exactly 6 games"); return; }
+    if (score1 > 6 || score2 > 6) { flash("Max score is 6"); return; }
+    const t = data.tourney, slot = t.ko[round];
+    if (!slot) return;
+    const team1 = t.teams.find(tm => tm.id === slot.team1Id);
+    const team2 = t.teams.find(tm => tm.id === slot.team2Id);
+    if (!team1 || !team2) return;
+    const won1 = score1 > score2, mid = Date.now();
+    const avg1 = teamAvgElo(data.players, [team1.p1, team1.p2]);
+    const avg2 = teamAvgElo(data.players, [team2.p1, team2.p2]);
+    const players = data.players.map(p => {
+      const isT1 = [team1.p1, team1.p2].includes(p.id);
+      const isT2 = [team2.p1, team2.p2].includes(p.id);
+      if (!isT1 && !isT2) return p;
+      const won = isT1 ? won1 : !won1;
+      const newElo = Math.max(0, calcElo(p.elo, isT1 ? avg2 : avg1, won));
+      return { ...p, elo: newElo, wins: p.wins + (won ? 1 : 0), losses: p.losses + (won ? 0 : 1), history: [...p.history, { matchId: mid, elo: newElo, date: new Date().toISOString().slice(0, 10) }] };
+    });
+    const newKo = { ...t.ko, [round]: { ...slot, score1, score2 } };
+    const winnerId = won1 ? slot.team1Id : slot.team2Id;
+    const loserId = won1 ? slot.team2Id : slot.team1Id;
+    if (round === "sf1" || round === "sf2") {
+      const other = newKo[round === "sf1" ? "sf2" : "sf1"];
+      if (other?.score1 != null && other?.score2 != null) {
+        const ow = other.score1 > other.score2 ? other.team1Id : other.team2Id;
+        const ol = other.score1 > other.score2 ? other.team2Id : other.team1Id;
+        const [ft1, ft2] = round === "sf1" ? [winnerId, ow] : [ow, winnerId];
+        const [tt1, tt2] = round === "sf1" ? [loserId, ol] : [ol, loserId];
+        newKo.final = { team1Id: ft1, team2Id: ft2, score1: null, score2: null };
+        newKo.third = { team1Id: tt1, team2Id: tt2, score1: null, score2: null };
+      }
+    }
+    save({ ...data, players, tourney: { ...t, ko: newKo } });
+    setKoMatchForm({ round: "sf1", s1: "", s2: "" }); flash(`${round.toUpperCase()} result saved!`);
+  }
+
+  function resetKoMatch(round) {
+    const t = data.tourney, slot = t.ko[round];
+    if (!slot) return;
+    const newKo = { ...t.ko, [round]: { ...slot, score1: null, score2: null } };
+    if (round === "sf1" || round === "sf2") { newKo.final = null; newKo.third = null; }
+    save({ ...data, tourney: { ...t, ko: newKo } }); flash("Match reset");
+  }
+
+  const sorted = [...data.players].sort((a, b) => b.elo - a.elo);
+  const filteredPlayers = sorted
+    .filter(p => genderFilter === "all" || p.gender === genderFilter)
+    .filter(p => tierFilter === "all" || getTier(p.elo).label === tierFilter);
+  const filteredMatches = selectedTournament === "all" ? data.matches : data.matches.filter(m => String(m.tournament) === selectedTournament);
+  const tourney = data.tourney;
+
+  const inp = { fontSize: 14, padding: "6px 10px", borderRadius: 6, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-secondary)", color: "var(--color-text-primary)", width: "100%", boxSizing: "border-box" };
+  const btn = { fontSize: 13, padding: "7px 16px", borderRadius: 6, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", cursor: "pointer" };
+  const pbtn = { ...btn, background: "#1D9E75", border: "none", color: "#fff" };
+  const dbtn = { ...btn, background: "#E24B4A", border: "none", color: "#fff" };
+
+  function pName(id) { return data.players.find(p => p.id === id)?.name || "?"; }
+  function tName(id) { return tourney?.teams.find(t => t.id === id)?.name || "?"; }
+  function tPlayers(id) { const t = tourney?.teams.find(t => t.id === id); return t ? `${pName(t.p1)} & ${pName(t.p2)}` : ""; }
+  function getPendingMatches(group) { return (tourney?.schedule[group] || []).filter(m => m.score1 === null); }
+
+  function Avatar({ name, size = 34 }) {
+    const initials = name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
+    const cols = ["#534AB7", "#1D9E75", "#D85A30", "#D4537E", "#378ADD", "#639922", "#BA7517"];
+    const c = cols[name.charCodeAt(0) % cols.length];
+    return <div style={{ width: size, height: size, borderRadius: "50%", background: c + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.34, fontWeight: 500, color: c, flexShrink: 0 }}>{initials}</div>;
+  }
+
+  function TierBadge({ elo }) {
+    const tier = getTier(elo);
+    return <span style={{ fontSize: 10, padding: "2px 7px", borderRadius: 10, background: tier.bg, color: tier.color, fontWeight: 500, whiteSpace: "nowrap" }}>{tier.label}</span>;
+  }
+
+  function RatingChip({ before, after }) {
+    const d = after - before;
+    return <span style={{ fontSize: 11, color: d > 0 ? "#0F6E56" : d < 0 ? "#A32D2D" : "var(--color-text-secondary)" }}>{d > 0 ? "+" : ""}{d}</span>;
+  }
+
+  function MiniChart({ history }) {
+    if (!history || history.length < 2) return null;
+    const vals = history.map(h => h.elo);
+    const min = Math.min(...vals), max = Math.max(...vals), range = max - min || 1;
+    const w = 80, h = 28;
+    const pts = vals.map((v, i) => `${(i / (vals.length - 1)) * w},${h - ((v - min) / range) * (h - 4) - 2}`).join(" ");
+    return <svg width={w} height={h} style={{ overflow: "visible" }}><polyline points={pts} fill="none" stroke={vals[vals.length - 1] >= vals[0] ? "#1D9E75" : "#E24B4A"} strokeWidth="1.5" strokeLinejoin="round" /></svg>;
+  }
+
+  function StandingsTable({ group }) {
+    const rows = getGroupStandings(group);
+    const schedule = tourney?.schedule[group] || [];
+    const played = schedule.filter(m => m.score1 !== null).length;
+    return (
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+          <div style={{ fontWeight: 500, fontSize: 14, color: group === "A" ? "#185FA5" : "#993556" }}>Group {group}</div>
+          <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{played}/{schedule.length} matches played</span>
+        </div>
+        <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 10, overflow: "hidden" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 40px 40px 40px 40px 50px", padding: "6px 12px", background: "var(--color-background-secondary)", fontSize: 11, color: "var(--color-text-secondary)", fontWeight: 500 }}>
+            <span>Team</span><span style={{ textAlign: "center" }}>P</span><span style={{ textAlign: "center" }}>W</span><span style={{ textAlign: "center" }}>L</span><span style={{ textAlign: "center" }}>GF</span><span style={{ textAlign: "center" }}>PTS</span>
+          </div>
+          {rows.length === 0 && <div style={{ padding: "10px 12px", fontSize: 13, color: "var(--color-text-tertiary)" }}>No teams yet</div>}
+          {rows.map((r, i) => (
+            <div key={r.id} style={{ display: "grid", gridTemplateColumns: "1fr 40px 40px 40px 40px 50px", padding: "8px 12px", borderTop: "0.5px solid var(--color-border-tertiary)", alignItems: "center", background: i < 2 ? (group === "A" ? "#E6F1FB44" : "#FBEAF044") : "transparent" }}>
+              <div>
+                <span style={{ fontSize: 13, fontWeight: i < 2 ? 500 : 400 }}>{r.name}</span>
+                {i < 2 && <span style={{ fontSize: 10, marginLeft: 6, color: group === "A" ? "#185FA5" : "#993556", background: group === "A" ? "#E6F1FB" : "#FBEAF0", padding: "1px 6px", borderRadius: 10 }}>ADV</span>}
+                <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{pName(r.p1)} & {pName(r.p2)}</div>
+              </div>
+              <span style={{ textAlign: "center", fontSize: 13 }}>{r.played}</span>
+              <span style={{ textAlign: "center", fontSize: 13 }}>{r.wins}</span>
+              <span style={{ textAlign: "center", fontSize: 13 }}>{r.losses}</span>
+              <span style={{ textAlign: "center", fontSize: 13 }}>{r.gf}</span>
+              <span style={{ textAlign: "center", fontSize: 15, fontWeight: 500 }}>{r.pts}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function BracketSlot({ label, slot, round }) {
+    const done = slot && slot.score1 != null && slot.score2 != null;
+    const won1 = done && slot.score1 > slot.score2;
+    return (
+      <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 10, padding: "10px 14px", marginBottom: 10 }}>
+        <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginBottom: 6, fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</div>
+        {!slot ? <div style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Waiting...</div> : (
+          <>
+            {[{ id: slot.team1Id, score: slot.score1, won: done && won1 }, { id: slot.team2Id, score: slot.score2, won: done && !won1 }].map((side, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", borderBottom: i === 0 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                <span style={{ flex: 1, fontSize: 13, fontWeight: side.won ? 500 : 400 }}>{tName(side.id)}</span>
+                <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>{tPlayers(side.id)}</span>
+                <span style={{ fontSize: 16, fontWeight: 600, minWidth: 20, textAlign: "right", color: side.won ? "#1D9E75" : "var(--color-text-primary)" }}>{side.score != null ? side.score : "–"}</span>
+              </div>
+            ))}
+            {done && isAdmin && <button style={{ fontSize: 11, padding: "3px 10px", borderRadius: 4, border: "0.5px solid var(--color-border-secondary)", background: "transparent", color: "var(--color-text-secondary)", cursor: "pointer", marginTop: 6 }} onClick={() => resetKoMatch(round)}>reset</button>}
+          </>
+        )}
+      </div>
+    );
+  }
+
+  const allTabs = ["leaderboard", "matches", "players", "tournament", ...(isAdmin ? ["log match", "manage"] : [])];
+
+  return (
+    <div style={{ maxWidth: 680, margin: "0 auto", padding: "1rem 0", fontFamily: "var(--font-sans)" }}>
+      <h2 className="sr-only">Pegel Padel Tracker</h2>
+      {msg && <div style={{ background: "#1D9E7522", color: "#0F6E56", padding: "8px 14px", borderRadius: 8, fontSize: 13, marginBottom: 12 }}>{msg}</div>}
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <div>
+          <span style={{ fontSize: 20, fontWeight: 500 }}>Player Rankings</span>
+          <span style={{ fontSize: 13, color: "var(--color-text-secondary)", marginLeft: 8 }}>Pegel Padel</span>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {isAdmin && <span style={{ fontSize: 12, color: "#1D9E75", border: "0.5px solid #1D9E75", borderRadius: 20, padding: "2px 10px" }}>Admin</span>}
+          {isAdmin ? <button style={btn} onClick={() => setIsAdmin(false)}>Log out</button> : <button style={btn} onClick={() => setShowLogin(true)}>Admin login</button>}
+        </div>
+      </div>
+
+      {showLogin && (
+        <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 12, padding: "1.25rem", marginBottom: 16 }}>
+          <p style={{ margin: "0 0 10px", fontWeight: 500, fontSize: 15 }}>Admin login</p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input type="password" placeholder="Password" value={pwInput} onChange={e => { setPwInput(e.target.value); setPwError(false); }} onKeyDown={e => e.key === "Enter" && login()} style={{ ...inp, flex: 1 }} />
+            <button style={pbtn} onClick={login}>Enter</button>
+            <button style={btn} onClick={() => { setShowLogin(false); setPwInput(""); setPwError(false); }}>Cancel</button>
+          </div>
+          {pwError && <p style={{ color: "var(--color-text-danger)", fontSize: 12, margin: "6px 0 0" }}>Incorrect password</p>}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 2, marginBottom: 16, borderBottom: "0.5px solid var(--color-border-tertiary)", overflowX: "auto" }}>
+        {allTabs.map(t => (
+          <button key={t} onClick={() => { setTab(t); setSelectedPlayer(null); }} style={{ fontSize: 13, padding: "7px 13px", border: "none", borderBottom: tab === t ? "2px solid #1D9E75" : "2px solid transparent", background: "transparent", color: tab === t ? "#1D9E75" : "var(--color-text-secondary)", cursor: "pointer", fontWeight: tab === t ? 500 : 400, textTransform: "capitalize", whiteSpace: "nowrap", flexShrink: 0 }}>{t}</button>
+        ))}
+      </div>
+
+      {(tab === "leaderboard" || tab === "players") && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {["all", "male", "female"].map(g => (
+              <button key={g} onClick={() => setGenderFilter(g)} style={{ fontSize: 12, padding: "4px 12px", borderRadius: 20, border: "0.5px solid var(--color-border-secondary)", background: genderFilter === g ? "#1D9E75" : "var(--color-background-primary)", color: genderFilter === g ? "#fff" : "var(--color-text-secondary)", cursor: "pointer", textTransform: "capitalize" }}>{g}</button>
+            ))}
+          </div>
+          {tab === "leaderboard" && (
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <button onClick={() => setTierFilter("all")} style={{ fontSize: 12, padding: "4px 12px", borderRadius: 20, border: "0.5px solid var(--color-border-secondary)", background: tierFilter === "all" ? "#534AB7" : "var(--color-background-primary)", color: tierFilter === "all" ? "#fff" : "var(--color-text-secondary)", cursor: "pointer" }}>All tiers</button>
+              {TIERS.map(t => (
+                <button key={t.label} onClick={() => setTierFilter(tierFilter === t.label ? "all" : t.label)} style={{ fontSize: 12, padding: "4px 12px", borderRadius: 20, border: `0.5px solid ${t.color}44`, background: tierFilter === t.label ? t.bg : "var(--color-background-primary)", color: tierFilter === t.label ? t.color : "var(--color-text-secondary)", cursor: "pointer", fontWeight: tierFilter === t.label ? 500 : 400 }}>{t.label}</button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "matches" && (
+        <div style={{ marginBottom: 12 }}>
+          <select value={selectedTournament} onChange={e => setSelectedTournament(e.target.value)} style={{ ...inp, width: "auto", minWidth: 180 }}>
+            <option value="all">All tournaments</option>
+            {data.tournaments.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+        </div>
+      )}
+
+      {tab === "leaderboard" && (
+        <div>
+          {filteredPlayers.length === 0 && <p style={{ color: "var(--color-text-secondary)", fontSize: 14 }}>No players match this filter.</p>}
+          {filteredPlayers.map((p, i) => (
+            <div key={p.id} onClick={() => { setSelectedPlayer(p); setTab("players"); }} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 10, marginBottom: 8, cursor: "pointer" }}>
+              <span style={{ fontSize: 13, color: "var(--color-text-tertiary)", width: 18, textAlign: "center" }}>{i + 1}</span>
+              <Avatar name={p.name} />
+              <div style={{ flex: 1 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontWeight: 500, fontSize: 15 }}>{p.name}</span>
+                  <TierBadge elo={p.elo} />
+                </div>
+                <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{p.wins}W / {p.losses}L &nbsp;·&nbsp; {p.wins + p.losses > 0 ? Math.round(p.wins / (p.wins + p.losses) * 100) : 0}% win rate</div>
+              </div>
+              <MiniChart history={p.history} />
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontWeight: 500, fontSize: 18, color: i === 0 ? "#BA7517" : "var(--color-text-primary)" }}>{p.elo}</div>
+                <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>Rating</div>
+              </div>
+            </div>
+          ))}
+          <div style={{ marginTop: 24, padding: "12px 14px", background: "var(--color-background-secondary)", borderRadius: 10 }}>
+            <div style={{ fontSize: 12, fontWeight: 500, color: "var(--color-text-secondary)", marginBottom: 8 }}>Rating tiers</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {TIERS.map(t => (
+                <span key={t.label} style={{ fontSize: 11, padding: "2px 8px", borderRadius: 10, background: t.bg, color: t.color, fontWeight: 500 }}>
+                  {t.label} <span style={{ opacity: 0.7 }}>{t.min === 5001 ? "5001+" : `${t.min}–${t.max}`}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab === "players" && (
+        <div>
+          {selectedPlayer ? (
+            <div>
+              <button style={{ ...btn, marginBottom: 14, fontSize: 12 }} onClick={() => setSelectedPlayer(null)}>← Back</button>
+              <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1.25rem", marginBottom: 16 }}>
+                <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 16 }}>
+                  <Avatar name={selectedPlayer.name} size={48} />
+                  <div>
+                    <div style={{ fontWeight: 500, fontSize: 18 }}>{selectedPlayer.name}</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+                      <span style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>{selectedPlayer.elo} Rating</span>
+                      <TierBadge elo={selectedPlayer.elo} />
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10 }}>
+                  {[["Matches", selectedPlayer.wins + selectedPlayer.losses], ["Wins", selectedPlayer.wins], ["Losses", selectedPlayer.losses]].map(([l, v]) => (
+                    <div key={l} style={{ background: "var(--color-background-secondary)", borderRadius: 8, padding: "10px 14px" }}>
+                      <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{l}</div>
+                      <div style={{ fontWeight: 500, fontSize: 20 }}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <p style={{ fontWeight: 500, fontSize: 14, marginBottom: 8 }}>Rating history</p>
+              {selectedPlayer.history && selectedPlayer.history.length > 1 ? (
+                <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1rem", marginBottom: 16 }}>
+                  <ResponsiveContainer width="100%" height={180}>
+                    <LineChart data={[{ elo: selectedPlayer.history[0]?.elo ?? 0, index: 0 }, ...selectedPlayer.history.map((h, i) => ({ elo: h.elo, index: i + 1 }))]} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
+                      <XAxis dataKey="index" hide />
+                      <YAxis tick={{ fontSize: 11, fill: "var(--color-text-tertiary)" }} width={48} />
+                      <Tooltip formatter={(v) => [`${v} Rating`, ""]} labelFormatter={() => ""} contentStyle={{ fontSize: 12, borderRadius: 8, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                      <ReferenceLine y={selectedPlayer.history[0]?.elo ?? 0} stroke="var(--color-border-secondary)" strokeDasharray="3 3" />
+                      <Line type="monotone" dataKey="elo" stroke="#1D9E75" strokeWidth={2} dot={{ r: 3, fill: "#1D9E75", strokeWidth: 0 }} activeDot={{ r: 5 }} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 11, color: "var(--color-text-tertiary)" }}>
+                    <span>Start: {selectedPlayer.history[0]?.elo ?? 0}</span>
+                    <span style={{ color: (() => { const d = selectedPlayer.elo - (selectedPlayer.history[0]?.elo ?? 0); return d > 0 ? "#0F6E56" : d < 0 ? "#A32D2D" : "var(--color-text-tertiary)"; })() }}>
+                      {(() => { const d = selectedPlayer.elo - (selectedPlayer.history[0]?.elo ?? 0); return (d > 0 ? "+" : "") + d; })()}
+                    </span>
+                    <span>Now: {selectedPlayer.elo}</span>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ background: "var(--color-background-secondary)", borderRadius: 10, padding: "12px 14px", marginBottom: 16, fontSize: 13, color: "var(--color-text-tertiary)" }}>Not enough match data yet.</div>
+              )}
+              <p style={{ fontWeight: 500, fontSize: 14, marginBottom: 8 }}>Match history</p>
+              {data.matches.filter(m => [...m.team1.playerIds, ...m.team2.playerIds].includes(selectedPlayer.id)).map(m => {
+                const onT1 = m.team1.playerIds.includes(selectedPlayer.id);
+                const my = onT1 ? m.team1 : m.team2, opp = onT1 ? m.team2 : m.team1;
+                const won = my.score > opp.score;
+                const ec = m.eloChanges?.[selectedPlayer.id];
+                return (
+                  <div key={m.id} style={{ padding: "8px 12px", background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 8, marginBottom: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 20, background: won ? "#1D9E7522" : "#E24B4A22", color: won ? "#0F6E56" : "#A32D2D" }}>{won ? "W" : "L"}</span>
+                      <div style={{ flex: 1, fontSize: 13 }}>
+                        <span style={{ fontWeight: 500 }}>{my.playerIds.map(pName).join(" & ")}</span>
+                        <span style={{ color: "var(--color-text-secondary)", margin: "0 6px" }}>{my.score} – {opp.score}</span>
+                        <span>{opp.playerIds.map(pName).join(" & ")}</span>
+                      </div>
+                      {ec && <RatingChip before={ec.before} after={ec.after} />}
+                      <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{m.date}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div>
+              {filteredPlayers.map(p => (
+                <div key={p.id} onClick={() => setSelectedPlayer(p)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 10, marginBottom: 8, cursor: "pointer" }}>
+                  <Avatar name={p.name} />
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontWeight: 500 }}>{p.name}</span>
+                      <TierBadge elo={p.elo} />
+                    </div>
+                    <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{p.wins + p.losses} matches played</div>
+                  </div>
+                  <span style={{ fontSize: 16, fontWeight: 500 }}>{p.elo}</span>
+                </div>
+              ))}
+              {filteredPlayers.length === 0 && <p style={{ color: "var(--color-text-secondary)", fontSize: 14 }}>No players yet.</p>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "matches" && (
+        <div>
+          {filteredMatches.length === 0 && <p style={{ color: "var(--color-text-secondary)", fontSize: 14 }}>No matches yet.</p>}
+          {filteredMatches.map(m => {
+            const won1 = m.team1.score > m.team2.score;
+            return (
+              <div key={m.id} style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 10, padding: "10px 14px", marginBottom: 8 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", alignItems: "center", gap: 8 }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {m.team1.playerIds.map(id => { const ec = m.eloChanges?.[id]; return (
+                      <div key={id} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <Avatar name={pName(id)} size={24} />
+                        <span style={{ fontSize: 13, fontWeight: won1 ? 500 : 400 }}>{pName(id)}</span>
+                        {ec && <RatingChip before={ec.before} after={ec.after} />}
+                      </div>
+                    ); })}
+                  </div>
+                  <div style={{ textAlign: "center" }}>
+                    <div style={{ fontSize: 20, fontWeight: 600 }}>{m.team1.score} – {m.team2.score}</div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{m.date}</div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
+                    {m.team2.playerIds.map(id => { const ec = m.eloChanges?.[id]; return (
+                      <div key={id} style={{ display: "flex", alignItems: "center", gap: 6, flexDirection: "row-reverse" }}>
+                        <Avatar name={pName(id)} size={24} />
+                        <span style={{ fontSize: 13, fontWeight: !won1 ? 500 : 400 }}>{pName(id)}</span>
+                        {ec && <RatingChip before={ec.before} after={ec.after} />}
+                      </div>
+                    ); })}
+                  </div>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 11, color: "var(--color-text-tertiary)" }}>
+                  <span>{m.tournament ? data.tournaments.find(t => t.id === m.tournament)?.name : ""}</span>
+                  {isAdmin && <span onClick={() => deleteMatch(m.id)} style={{ color: "var(--color-text-danger)", cursor: "pointer" }}>delete</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {tab === "tournament" && (
+        <div>
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontWeight: 500, fontSize: 16, marginBottom: 2 }}>{TOURNEY_NAME}</div>
+            <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>2 groups · 6 teams each · First to 4 (group) / First to 6 (KO)</div>
+          </div>
+          {!tourney ? (
+            isAdmin ? <button style={pbtn} onClick={initTourney}>Initialize tournament</button> : <p style={{ color: "var(--color-text-secondary)", fontSize: 14 }}>Tournament not started yet.</p>
+          ) : (
+            <>
+              <div style={{ display: "flex", gap: 2, marginBottom: 16, borderBottom: "0.5px solid var(--color-border-tertiary)", overflowX: "auto" }}>
+                {["standings", "schedule", "bracket", ...(isAdmin ? ["log group match", "log KO match", "manage teams"] : [])].map(t => (
+                  <button key={t} onClick={() => setTTab(t)} style={{ fontSize: 12, padding: "6px 12px", border: "none", borderBottom: tTab === t ? "2px solid #1D9E75" : "2px solid transparent", background: "transparent", color: tTab === t ? "#1D9E75" : "var(--color-text-secondary)", cursor: "pointer", fontWeight: tTab === t ? 500 : 400, textTransform: "capitalize", whiteSpace: "nowrap" }}>{t}</button>
+                ))}
+              </div>
+              {tTab === "standings" && (<div><StandingsTable group="A" /><StandingsTable group="B" />{isAdmin && <button style={pbtn} onClick={setKoSlots}>Set knockout bracket from standings</button>}</div>)}
+              {tTab === "schedule" && (
+                <div>
+                  {["A", "B"].map(g => {
+                    const schedule = tourney.schedule[g] || [];
+                    const gTeams = tourney.teams.filter(t => t.group === g);
+                    return (
+                      <div key={g} style={{ marginBottom: 24 }}>
+                        <div style={{ fontWeight: 500, fontSize: 14, marginBottom: 10, color: g === "A" ? "#185FA5" : "#993556" }}>
+                          Group {g} schedule {gTeams.length < 6 && <span style={{ fontSize: 11, color: "var(--color-text-tertiary)", fontWeight: 400, marginLeft: 8 }}>({gTeams.length}/6 — generates at 6)</span>}
+                        </div>
+                        {schedule.length === 0 && <p style={{ fontSize: 13, color: "var(--color-text-tertiary)" }}>Schedule not yet generated.</p>}
+                        {schedule.map((m, i) => {
+                          const done = m.score1 !== null, won1 = done && m.score1 > m.score2;
+                          return (
+                            <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 12px", background: done ? "var(--color-background-secondary)" : "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 8, marginBottom: 6, opacity: done ? 0.8 : 1 }}>
+                              <span style={{ fontSize: 11, color: "var(--color-text-tertiary)", width: 20 }}>M{i + 1}</span>
+                              <span style={{ flex: 1, fontSize: 13, fontWeight: done && won1 ? 500 : 400 }}>{tName(m.team1Id)}</span>
+                              <span style={{ fontSize: done ? 16 : 13, fontWeight: done ? 600 : 400, color: done ? "var(--color-text-primary)" : "var(--color-text-tertiary)", minWidth: 50, textAlign: "center" }}>{done ? `${m.score1} – ${m.score2}` : "vs"}</span>
+                              <span style={{ flex: 1, fontSize: 13, fontWeight: done && !won1 ? 500 : 400, textAlign: "right" }}>{tName(m.team2Id)}</span>
+                              {done && <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 10, background: "#1D9E7522", color: "#0F6E56" }}>done</span>}
+                              {done && isAdmin && <span onClick={() => resetGroupMatch(m.id)} style={{ fontSize: 11, color: "var(--color-text-danger)", cursor: "pointer" }}>reset</span>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              {tTab === "bracket" && (
+                <div>
+                  <div style={{ fontWeight: 500, fontSize: 14, marginBottom: 10, color: "var(--color-text-secondary)" }}>Semifinals</div>
+                  <BracketSlot label="SF1 — A1 vs B2" slot={tourney.ko?.sf1} round="sf1" />
+                  <BracketSlot label="SF2 — B1 vs A2" slot={tourney.ko?.sf2} round="sf2" />
+                  <div style={{ fontWeight: 500, fontSize: 14, margin: "16px 0 10px", color: "var(--color-text-secondary)" }}>Finals</div>
+                  <BracketSlot label="3rd place match" slot={tourney.ko?.third} round="third" />
+                  <BracketSlot label="Final" slot={tourney.ko?.final} round="final" />
+                  {tourney.ko?.final?.score1 != null && tourney.ko?.final?.score2 != null && (
+                    <div style={{ marginTop: 16, padding: "14px 16px", background: "#BA751722", border: "0.5px solid #BA7517", borderRadius: 10, textAlign: "center" }}>
+                      <div style={{ fontSize: 12, color: "#BA7517", fontWeight: 500, marginBottom: 4 }}>Champion</div>
+                      <div style={{ fontSize: 18, fontWeight: 500 }}>{tName(tourney.ko.final.score1 > tourney.ko.final.score2 ? tourney.ko.final.team1Id : tourney.ko.final.team2Id)}</div>
+                      <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{tPlayers(tourney.ko.final.score1 > tourney.ko.final.score2 ? tourney.ko.final.team1Id : tourney.ko.final.team2Id)}</div>
+                    </div>
+                  )}
+                </div>
+              )}
+              {tTab === "log group match" && isAdmin && (
+                <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1.25rem" }}>
+                  <p style={{ fontWeight: 500, margin: "0 0 14px" }}>Log group match (first to 4)</p>
+                  <div style={{ display: "grid", gap: 10, marginBottom: 12 }}>
+                    <div>
+                      <label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Select match</label>
+                      <select value={groupMatchForm.matchId} onChange={e => setGroupMatchForm({ ...groupMatchForm, matchId: e.target.value })} style={{ ...inp, marginTop: 4 }}>
+                        <option value="">Choose a pending match...</option>
+                        {["A", "B"].map(g => { const pending = getPendingMatches(g); if (!pending.length) return null; return <optgroup key={g} label={`Group ${g}`}>{pending.map(m => { const allM = tourney.schedule[g] || []; const idx = allM.findIndex(x => x.id === m.id); return <option key={m.id} value={m.id}>M{idx + 1}: {tName(m.team1Id)} vs {tName(m.team2Id)}</option>; })}</optgroup>; })}
+                      </select>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      <div>
+                        <label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Score — {groupMatchForm.matchId ? tName((() => { for (const g of ["A","B"]) { const m = tourney.schedule[g]?.find(m => m.id === groupMatchForm.matchId); if (m) return m.team1Id; } return null; })()) : "Team 1"}</label>
+                        <input type="number" min="0" max="4" value={groupMatchForm.s1} onChange={e => setGroupMatchForm({ ...groupMatchForm, s1: e.target.value })} style={{ ...inp, marginTop: 4 }} />
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Score — {groupMatchForm.matchId ? tName((() => { for (const g of ["A","B"]) { const m = tourney.schedule[g]?.find(m => m.id === groupMatchForm.matchId); if (m) return m.team2Id; } return null; })()) : "Team 2"}</label>
+                        <input type="number" min="0" max="4" value={groupMatchForm.s2} onChange={e => setGroupMatchForm({ ...groupMatchForm, s2: e.target.value })} style={{ ...inp, marginTop: 4 }} />
+                      </div>
+                    </div>
+                  </div>
+                  <button style={pbtn} onClick={logGroupMatch}>Log match</button>
+                </div>
+              )}
+              {tTab === "log KO match" && isAdmin && (
+                <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1.25rem" }}>
+                  <p style={{ fontWeight: 500, margin: "0 0 14px" }}>Log knockout match (first to 6)</p>
+                  {!tourney.ko?.sf1 ? <p style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>Set the knockout bracket from Standings first.</p> : (
+                    <>
+                      <div style={{ marginBottom: 10 }}>
+                        <label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Round</label>
+                        <select value={koMatchForm.round} onChange={e => setKoMatchForm({ ...koMatchForm, round: e.target.value })} style={{ ...inp, marginTop: 4 }}>
+                          {tourney.ko?.sf1 && <option value="sf1">SF1 — {tName(tourney.ko.sf1.team1Id)} vs {tName(tourney.ko.sf1.team2Id)}</option>}
+                          {tourney.ko?.sf2 && <option value="sf2">SF2 — {tName(tourney.ko.sf2.team1Id)} vs {tName(tourney.ko.sf2.team2Id)}</option>}
+                          {tourney.ko?.third && <option value="third">3rd place — {tName(tourney.ko.third.team1Id)} vs {tName(tourney.ko.third.team2Id)}</option>}
+                          {tourney.ko?.final && <option value="final">Final — {tName(tourney.ko.final.team1Id)} vs {tName(tourney.ko.final.team2Id)}</option>}
+                        </select>
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+                        <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Score team 1</label><input type="number" min="0" max="6" value={koMatchForm.s1} onChange={e => setKoMatchForm({ ...koMatchForm, s1: e.target.value })} style={{ ...inp, marginTop: 4 }} /></div>
+                        <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Score team 2</label><input type="number" min="0" max="6" value={koMatchForm.s2} onChange={e => setKoMatchForm({ ...koMatchForm, s2: e.target.value })} style={{ ...inp, marginTop: 4 }} /></div>
+                      </div>
+                      <button style={pbtn} onClick={() => logKoMatch(koMatchForm.round)}>Save result</button>
+                    </>
+                  )}
+                </div>
+              )}
+              {tTab === "manage teams" && isAdmin && (
+                <div>
+                  <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1.25rem", marginBottom: 16 }}>
+                    <p style={{ fontWeight: 500, margin: "0 0 12px" }}>Add team</p>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+                      <div style={{ gridColumn: "1 / -1" }}><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Team name</label><input value={teamForm.name} onChange={e => setTeamForm({ ...teamForm, name: e.target.value })} placeholder="e.g. Team Rocket" style={{ ...inp, marginTop: 4 }} /></div>
+                      <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Player 1</label><div style={{ marginTop: 4 }}><PlayerSelect value={teamForm.p1} onChange={v => setTeamForm({ ...teamForm, p1: v })} exclude={[parseInt(teamForm.p2)].filter(Boolean)} players={data.players} inp={inp} /></div></div>
+                      <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Player 2</label><div style={{ marginTop: 4 }}><PlayerSelect value={teamForm.p2} onChange={v => setTeamForm({ ...teamForm, p2: v })} exclude={[parseInt(teamForm.p1)].filter(Boolean)} players={data.players} inp={inp} /></div></div>
+                      <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Group</label><select value={teamForm.group} onChange={e => setTeamForm({ ...teamForm, group: e.target.value })} style={{ ...inp, marginTop: 4 }}><option value="A">Group A ({tourney.teams.filter(t => t.group === "A").length}/6)</option><option value="B">Group B ({tourney.teams.filter(t => t.group === "B").length}/6)</option></select></div>
+                    </div>
+                    <button style={pbtn} onClick={addTeam}>Add team</button>
+                  </div>
+                  {["A", "B"].map(g => (
+                    <div key={g} style={{ marginBottom: 16 }}>
+                      <div style={{ fontWeight: 500, fontSize: 13, marginBottom: 8, color: g === "A" ? "#185FA5" : "#993556" }}>Group {g}</div>
+                      {tourney.teams.filter(t => t.group === g).map(tm => (
+                        <div key={tm.id} style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 8, padding: "8px 12px", marginBottom: 6 }}>
+                          {editingTeam === tm.id ? (
+                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                              <div style={{ gridColumn: "1 / -1" }}><input value={editTeamForm.name} onChange={e => setEditTeamForm({ ...editTeamForm, name: e.target.value })} style={{ ...inp, fontSize: 13 }} /></div>
+                              <PlayerSelect value={editTeamForm.p1} onChange={v => setEditTeamForm({ ...editTeamForm, p1: v })} exclude={[parseInt(editTeamForm.p2)].filter(Boolean)} players={data.players} inp={inp} />
+                              <PlayerSelect value={editTeamForm.p2} onChange={v => setEditTeamForm({ ...editTeamForm, p2: v })} exclude={[parseInt(editTeamForm.p1)].filter(Boolean)} players={data.players} inp={inp} />
+                              <select value={editTeamForm.group} onChange={e => setEditTeamForm({ ...editTeamForm, group: e.target.value })} style={{ ...inp, fontSize: 12 }}><option value="A">Group A</option><option value="B">Group B</option></select>
+                              <div style={{ display: "flex", gap: 8 }}><span onClick={() => saveEditTeam(tm.id)} style={{ fontSize: 12, color: "#1D9E75", cursor: "pointer" }}>save</span><span onClick={() => setEditingTeam(null)} style={{ fontSize: 12, color: "var(--color-text-secondary)", cursor: "pointer" }}>cancel</span></div>
+                            </div>
+                          ) : (
+                            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                              <div style={{ flex: 1 }}><div style={{ fontWeight: 500, fontSize: 14 }}>{tm.name}</div><div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{pName(tm.p1)} & {pName(tm.p2)}</div></div>
+                              <span onClick={() => startEditTeam(tm)} style={{ fontSize: 12, color: "var(--color-text-info)", cursor: "pointer" }}>edit</span>
+                              <span onClick={() => deleteTeam(tm.id)} style={{ fontSize: 12, color: "var(--color-text-danger)", cursor: "pointer" }}>remove</span>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {tab === "log match" && isAdmin && (
+        <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1.25rem" }}>
+          <p style={{ fontWeight: 500, margin: "0 0 14px" }}>Log a 2v2 match</p>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <div style={{ fontSize: 12, fontWeight: 500, color: "#1D9E75", marginBottom: 6 }}>Team 1</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {["t1p1", "t1p2"].map((k, i) => (<div key={k}><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Player {i + 1}</label><select value={matchForm[k]} onChange={e => setMatchForm({ ...matchForm, [k]: e.target.value })} style={{ ...inp, marginTop: 4 }}><option value="">Select...</option>{data.players.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>))}
+              </div>
+            </div>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <div style={{ fontSize: 12, fontWeight: 500, color: "#D85A30", marginBottom: 6 }}>Team 2</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {["t2p1", "t2p2"].map((k, i) => (<div key={k}><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Player {i + 1}</label><select value={matchForm[k]} onChange={e => setMatchForm({ ...matchForm, [k]: e.target.value })} style={{ ...inp, marginTop: 4 }}><option value="">Select...</option>{data.players.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>))}
+              </div>
+            </div>
+            <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Score team 1</label><input type="number" min="0" value={matchForm.s1} onChange={e => setMatchForm({ ...matchForm, s1: e.target.value })} style={{ ...inp, marginTop: 4 }} /></div>
+            <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Score team 2</label><input type="number" min="0" value={matchForm.s2} onChange={e => setMatchForm({ ...matchForm, s2: e.target.value })} style={{ ...inp, marginTop: 4 }} /></div>
+            <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Date</label><input type="date" value={matchForm.date} onChange={e => setMatchForm({ ...matchForm, date: e.target.value })} style={{ ...inp, marginTop: 4 }} /></div>
+            <div><label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Tournament (optional)</label><select value={matchForm.tournament} onChange={e => setMatchForm({ ...matchForm, tournament: e.target.value })} style={{ ...inp, marginTop: 4 }}><option value="">None</option>{data.tournaments.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select></div>
+          </div>
+          <button style={pbtn} onClick={logMatch}>Log match</button>
+        </div>
+      )}
+
+      {tab === "manage" && isAdmin && (
+        <div style={{ display: "grid", gap: 16 }}>
+          <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1.25rem" }}>
+            <p style={{ fontWeight: 500, margin: "0 0 12px" }}>Add player</p>
+            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+              <input value={newPlayer} onChange={e => setNewPlayer(e.target.value)} onKeyDown={e => e.key === "Enter" && addPlayer()} placeholder="Player name" style={{ ...inp, flex: 1 }} />
+              <select value={newGender} onChange={e => setNewGender(e.target.value)} style={{ ...inp, width: 110 }}><option value="male">Male</option><option value="female">Female</option></select>
+              <input type="number" min="0" value={newRating} onChange={e => setNewRating(e.target.value)} placeholder="Rating" style={{ ...inp, width: 90 }} />
+              <button style={pbtn} onClick={addPlayer}>Add</button>
+            </div>
+            {data.players.length > 0 && (
+              <div style={{ marginTop: 12 }}>
+                {data.players.map(p => (
+                  <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                    {editingPlayer === p.id ? (
+                      <>
+                        <input value={editName} onChange={e => setEditName(e.target.value)} onKeyDown={e => { if (e.key === "Enter") saveEdit(p.id); if (e.key === "Escape") setEditingPlayer(null); }} style={{ ...inp, flex: 1, fontSize: 13 }} autoFocus />
+                        <select value={editGender} onChange={e => setEditGender(e.target.value)} style={{ ...inp, width: 90, fontSize: 12 }}><option value="male">Male</option><option value="female">Female</option></select>
+                        <input type="number" min="0" value={editRating} onChange={e => setEditRating(e.target.value)} style={{ ...inp, width: 80, fontSize: 12 }} />
+                        <span onClick={() => saveEdit(p.id)} style={{ fontSize: 12, color: "#1D9E75", cursor: "pointer" }}>save</span>
+                        <span onClick={() => setEditingPlayer(null)} style={{ fontSize: 12, color: "var(--color-text-secondary)", cursor: "pointer" }}>cancel</span>
+                      </>
+                    ) : (
+                      <>
+                        <Avatar name={p.name} size={26} />
+                        <span style={{ flex: 1, fontSize: 14 }}>{p.name}</span>
+                        <TierBadge elo={p.elo} />
+                        <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 20, background: p.gender === "female" ? "#D4537E22" : "#378ADD22", color: p.gender === "female" ? "#993556" : "#185FA5", textTransform: "capitalize" }}>{p.gender}</span>
+                        <span style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>{p.elo}</span>
+                        <span onClick={() => startEdit(p)} style={{ fontSize: 12, color: "var(--color-text-info)", cursor: "pointer" }}>edit</span>
+                        <span onClick={() => deletePlayer(p.id)} style={{ fontSize: 12, color: "var(--color-text-danger)", cursor: "pointer" }}>remove</span>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1.25rem" }}>
+            <p style={{ fontWeight: 500, margin: "0 0 12px" }}>Create tournament / season</p>
+            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+              <input value={tournamentForm.name} onChange={e => setTournamentForm({ ...tournamentForm, name: e.target.value })} onKeyDown={e => e.key === "Enter" && addTournament()} placeholder="Tournament name" style={{ ...inp, flex: 1 }} />
+              <input type="date" value={tournamentForm.date} onChange={e => setTournamentForm({ ...tournamentForm, date: e.target.value })} style={{ ...inp, width: 150 }} />
+              <button style={pbtn} onClick={addTournament}>Create</button>
+            </div>
+            {data.tournaments.map(t => (
+              <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                <span style={{ flex: 1, fontSize: 14 }}>{t.name}</span>
+                <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{t.date}</span>
+                <span onClick={() => deleteTournament(t.id)} style={{ fontSize: 12, color: "var(--color-text-danger)", cursor: "pointer" }}>delete</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ background: "var(--color-background-primary)", border: "0.5px solid #E24B4A44", borderRadius: 12, padding: "1.25rem" }}>
+            <p style={{ fontWeight: 500, margin: "0 0 6px", color: "var(--color-text-danger)" }}>Danger zone</p>
+            <p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: "0 0 12px" }}>Reset all player ratings to 0 and clear match history. This cannot be undone.</p>
+            {showResetConfirm ? (
+              <div style={{ display: "flex", gap: 8 }}>
+                <button style={dbtn} onClick={resetAllElo}>Yes, reset everything</button>
+                <button style={btn} onClick={() => setShowResetConfirm(false)}>Cancel</button>
+              </div>
+            ) : (
+              <button style={dbtn} onClick={() => setShowResetConfirm(true)}>Reset all ratings</button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
